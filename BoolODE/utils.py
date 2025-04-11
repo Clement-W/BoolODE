@@ -173,7 +173,7 @@ def get_ss(P):
 
 def generateInputFiles(resultDF, BoolDF, withoutRules,
                        parameterInputsDF,tmax,numcells,
-                       outPrefix=''):
+                       outPrefix='',n_snapshots=0):
     """
     Generates input files required from the Beeline pipeline
 
@@ -238,7 +238,11 @@ def generateInputFiles(resultDF, BoolDF, withoutRules,
     # PseudoTime.csv
     print('2. PseudoTime.csv')
     cellID = list(resultDF.columns)
-    time = [float(c.split('_')[1].replace('-','.')) for c in cellID]
+    
+    if(n_snapshots==0):
+        time = [float(c.split('_')[1].replace('-','.')) for c in cellID]
+    else:
+        time = [float(c.split('_')[1].replace('t', '').replace('-', '.')) for c in cellID]
     experiment = [int(c.split('_')[0].split('E')[1]) for c in cellID]
     pseudotime = minmaxnorm(time)
     cellID = [c.replace('-','_') for c in cellID]
@@ -250,25 +254,45 @@ def generateInputFiles(resultDF, BoolDF, withoutRules,
     PseudoTimeDF.index = PseudoTimeDF['Cell ID']
     
     # ExpressionData.csv
-    if len(resultDF.columns) < 1e3:
-        print('3. ExpressionData.csv')
-        columns = list(resultDF.columns)
-        columns = [c.replace('-','_') for c in columns]
-        resultDF.columns = columns
-        if parameterInputsDF is not None:
-            resultDF = resultDF.drop(withoutRules, axis=0)
-        resultDF.to_csv(str(outPrefix) + '/ExpressionData.csv',sep=',')
-    else:
-        print("Dataset too large."
-              "\nSampling %d cells, one from each simulated trajectory." % numcells)
-        times = np.random.choice([i for i in range(1,tmax*100)],numcells)
-        expdf = pd.DataFrame(columns=['E' + str(i) + '_' + str(times[i])\
-                                      for i in range(numcells)],
-                             index=resultDF.index)
-        for c in expdf.columns:
-            expdf[c] = resultDF[c]
-        expdf.to_csv(str(outPrefix) + '/ExpressionData.csv',sep=',')
+    print('3. ExpressionData.csv')
+    resultDF.columns = [c.replace('-', '_') for c in resultDF.columns]
+    if parameterInputsDF is not None:
+        resultDF = resultDF.drop(withoutRules, axis=0)
 
+    if n_snapshots > 0:
+        # Cells are tracked: one cell per row, snapshots in time across columns
+        print(f'   Detected tracked cells across {n_snapshots} snapshots.')
+        resultDF.to_csv(f"{outPrefix}/ExpressionData.csv", sep=',')
+
+        # Optional: Save map of cell identity over time
+        # Example: E0_0 -> snapshot 0 of cell 0
+        snapshot_mapping = {
+            'Cell ID': [],
+            'Snapshot': [],
+            'Original Cell': []
+        }
+        for col in resultDF.columns:
+            if '_' in col:
+                cell_id, snapshot_id = col.split('_')
+                snapshot_mapping['Cell ID'].append(col)
+                snapshot_mapping['Snapshot'].append(int(snapshot_id[1:]))
+                snapshot_mapping['Original Cell'].append(cell_id)
+
+        pd.DataFrame(snapshot_mapping).to_csv(f"{outPrefix}/SnapshotMap.csv", index=False)
+        
+    else:
+        if len(resultDF.columns) < 1e3:
+            resultDF.to_csv(f"{outPrefix}/ExpressionData.csv", sep=',')
+        else:
+            print("Dataset too large. Sampling one point per cell.")
+            times = np.random.choice([i for i in range(1, tmax * 100)], numcells)
+            expdf = pd.DataFrame(columns=[f'E{i}_{times[i]}' for i in range(numcells)],
+                                 index=resultDF.index)
+            for c in expdf.columns:
+                expdf[c] = resultDF[c]
+            expdf.to_csv(f"{outPrefix}/ExpressionData.csv", sep=',')
+
+    
 def sampleTimeSeries(num_timepoints, expnum,\
                      tspan,  P,\
                      varmapper,timeIndex,

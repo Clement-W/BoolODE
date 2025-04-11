@@ -10,7 +10,7 @@ def get_parser():
     parser = argparse.ArgumentParser(
         description='Run BoolODE to generate synthetic scRNAseq data.\n Please specify config file.')
 
-    parser.add_argument('--config', default='config.yaml',
+    parser.add_argument('--config', default='/home/cweinrei/Documents/BoolODE/config-files/beeline-inputs-boolean2.yaml',
         help='Path to config file')
 
     return parser

@@ -55,7 +55,7 @@ def Experiment(mg, Model,
     :param normalizeTrajectory: Bool specifying if the gene expression values should be scaled between 0 and 1.
     :type normalizeTrajectory: bool 
     """
-    ####################    
+    ####################
     allParameters = dict(mg.ModelSpec['pars'])
     parNames = sorted(list(allParameters.keys()))
     ## Use default parameters 
@@ -101,6 +101,9 @@ def Experiment(mg, Model,
         speciesoi = [revvarmapper['p_' + p] for p in proteinlist]
         speciesoi.extend([revvarmapper['x_' + g] for g in mg.genelist])
         result = pd.DataFrame(index=pd.Index([mg.varmapper[i] for i in speciesoi]))
+
+
+    n_snapshots = settings.get('n_snapshots', 0)
         
     # Index of every possible time point. Sample from this list
     startat = 0
@@ -129,6 +132,7 @@ def Experiment(mg, Model,
     argdict['proteinIndex'] = proteinIndex
     argdict['revvarmapper'] = revvarmapper
     argdict['x_max'] = mg.kineticParameterDefaults['x_max']
+    argdict['n_snapshots'] = n_snapshots
 
     if settings['sample_cells']:
         # pre-define the time points from which a cell will be sampled
@@ -148,21 +152,27 @@ def Experiment(mg, Model,
     if not os.path.exists(simfilepath):
         print(simfilepath, "does not exist, creating it...")
         os.makedirs(simfilepath)
-    print('Starting simulations')
+
+    print('n_snapshots =', n_snapshots)
+    print('Starting simulations...')
+
     start = time.time()
 
+    print('parallelize =', settings['doParallel'])
     if settings['doParallel']:
         with mp.Pool() as pool:
             jobs = []
             for cellid in range(settings['num_cells']):
+                #print(f'Simulating cell {cellid}...')
                 cell_args = dict(argdict, seed=cellid, cellid=cellid)
                 job = pool.apply_async(simulateAndSample, args=(cell_args,))
                 jobs.append(job)
                 
             for job in jobs:
-                job.wait()
+                job.get()
     else:
         for cellid in tqdm(range(settings['num_cells'])):
+            print(f'Simulating cell {cellid}...')
             argdict['seed'] = cellid
             argdict['cellid'] = cellid
             simulateAndSample(argdict)
@@ -172,15 +182,18 @@ def Experiment(mg, Model,
     print('starting to concat files')
     start = time.time()
 
-    for cellid in tqdm(range(settings['num_cells'])):
-        if settings['sample_cells']:
-            df = pd.read_csv(outPrefix + '/simulations/E'+str(cellid) + '-cell.csv',index_col=0)
-            df = df.sort_index()                
-        else:
-            df = pd.read_csv(outPrefix + '/simulations/E'+str(cellid) + '.csv',index_col=0)
-            df = df.sort_index()
-            groupedDict['E' + str(cellid)] = df.values.ravel()
-        frames.append(df.T)
+    for cellid in range(settings['num_cells']):
+        csvPath = f'{outPrefix}/simulations/E{cellid}.csv'
+        df = pd.read_csv(csvPath, index_col=0)
+        df = df.sort_index()
+
+        # In the standard, older workflow, we do a single timepoint -> we store raveled data for clustering
+        # But if n_snapshots>0, we might have multiple columns from each cell.
+        if n_snapshots == 0:
+            groupedDict[f'E{cellid}'] = df.values.ravel()
+
+        frames.append(df.T)  # store transposed for final concat
+
     stop = time.time()
     print("Concating files took %.2f s" %(stop-start))
     result = pd.concat(frames,axis=0)
@@ -189,7 +202,7 @@ def Experiment(mg, Model,
     newindices = [i.replace('x_','') for i in indices]
     result.index = pd.Index(newindices)
     
-    if settings['nClusters'] > 1:
+    if settings['nClusters'] > 1 and n_snapshots == 0:
         ## Carry out k-means clustering to identify which
         ## trajectory a simulation belongs to
         print('Starting k-means clustering')
@@ -197,20 +210,20 @@ def Experiment(mg, Model,
         print('Clustering simulations...')
         start = time.time()            
         # Find clusters in the experiments
-        clusterLabels= KMeans(n_clusters=settings['nClusters'],
-                              n_jobs=8).fit(groupedDF.T.values).labels_
+        clusterLabels= KMeans(n_clusters=settings['nClusters']).fit(groupedDF.T.values).labels_
         print('Clustering took %0.3fs' % (time.time() - start))
         clusterDF = pd.DataFrame(data=clusterLabels, index =\
                                  groupedDF.columns, columns=['cl'])
         clusterDF.to_csv(outPrefix + '/ClusterIds.csv')
     else:
-        print('Requested nClusters=1, not performing k-means clustering')
+        print(f'nClusters={settings.get("nClusters",1)} or n_snapshots={n_snapshots}, skipping k-means')
+
     ##################################################
-    
     return result
     
 def startRun(settings):
     """
+    settings contain n_snapshots
     Start a simulation run. Loads model file, starts an Experiment(),
     and generates the appropriate input files
     """
@@ -239,6 +252,8 @@ def startRun(settings):
     integration_step_size = settings['integration_step_size']
     tspan = np.linspace(0,tmax,int(tmax/integration_step_size))
 
+    print(settings)
+
     # Generate the ODE model from the specified boolean model
     mg = GenerateModel(settings,
                        parameterInputsDF,
@@ -265,7 +280,8 @@ def startRun(settings):
                              parameterInputsDF,
                              tmax,
                              settings['num_cells'],
-                             outPrefix=settings['outprefix'])
+                             outPrefix=settings['outprefix'],
+                             n_snapshots=settings.get('n_snapshots', 0))
     print('Input file generation took %0.2f s' % (time.time() - start))
     print("BoolODE.py took %0.2fs"% (time.time() - startfull))
 
@@ -300,6 +316,8 @@ def simulateAndSample(argdict):
     
     # Retained for debugging
     isStochastic = True
+
+    n_snapshots = argdict.get('n_snapshots', 0)
     
     if sampleCells:
         header = argdict['header']
@@ -312,12 +330,17 @@ def simulateAndSample(argdict):
     ## Boolean to check if a simulation is going to a
     ## 0 steady state, with all genes/proteins dying out
     retry = True
-    trys = 0
-    ## timepoints
-    tps = [i for i in range(1,len(tspan))]
-    ## gene ids
-    gid = [i for i,n in varmapper.items() if 'x_' in n]
-    outPrefix = outPrefix + '/simulations/'
+    tries = 0
+
+    outPrefix = os.path.join(argdict['outPrefix'], 'simulations')
+    os.makedirs(outPrefix, exist_ok=True)
+
+    # ## timepoints
+    # tps = [i for i in range(1,len(tspan))]
+    # ## gene ids
+    # gid = [i for i,n in varmapper.items() if 'x_' in n]
+
+    #print("Do simulation for cell %d" % cellid)
     while retry:
         seed += 1000
         y0_exp = simulator.getInitialCondition(ss, ModelSpec, rnaIndex, proteinIndex,
@@ -327,42 +350,62 @@ def simulateAndSample(argdict):
         P = simulator.simulateModel(Model, y0_exp, pars, isStochastic, tspan, seed)
         P = P.T
         retry = False
-        ## Extract Time points
-        subset = P[gid,:][:,tps]
-        df = pd.DataFrame(subset,
-                          index=pd.Index(genelist),
-                          columns = ['E' + str(cellid) +'_' +str(i)\
-                                     for i in tps])
-        df.to_csv(outPrefix + 'E' + str(cellid) + '.csv')        
-        ## Heuristic:
+        # 3) Check if everything died
         ## If the largest value of a protein achieved in a simulation is
         ## less than 10% of the y_max, drop the simulation.
         ## This check stems from the observation that in some simulations,
         ## all genes go to the 0 steady state in some rare simulations.
-        dfmax = df.max()
-        for col in df.columns:
-            colmax = df[col].max()
-            if colmax < 0.1*x_max:
-                retry= True
-                break
-        
+        maxExp = P[rnaIndex, :].max()
+        if maxExp < 0.1 * x_max:
+            retry = True
+        tries += 1
+    print("done")
+
+    # If n_snapshots == 0, keep old approach: single-time approach
+    if n_snapshots == 0:
+        # We skip the first time index for historical reasons: tps = [1..end]
+        timePoints = list(range(1, P.shape[1]))
+        subset = P[rnaIndex, :][:, timePoints]
+        colNames = [f'E{cellid}_{t}' for t in timePoints]
+        df = pd.DataFrame(subset, index=genelist, columns=colNames)
         if sampleCells:
             ## Write a single cell to file
             ## These samples allow for quickly and
             ## reproducibly testing the output.
             sampledf = utils.sampleCellFromTraj(cellid,
-                                          tspan, 
-                                          P,
-                                          varmapper, timeIndex,
-                                          genelist, proteinlist,
-                                          header,
-                                          writeProtein=writeProtein)
+                                            tspan, 
+                                            P,
+                                            varmapper, timeIndex,
+                                            genelist, proteinlist,
+                                            header,
+                                            writeProtein=writeProtein)
             sampledf = sampledf.T
             sampledf.to_csv(outPrefix + 'E' + str(cellid) + '-cell.csv')            
             
-        trys += 1
-        # write to file
-        df.to_csv(outPrefix + 'E' + str(cellid) + '.csv')
+
+    else:
+        # n_snapshots > 0: pick snapshots evenly across entire trajectory
+        # e.g. if P.shape[1] = 101 time steps, n_snapshots=5
+        # sample around [0, 25, 50, 75, 100]
+        steps = P.shape[1] - 1
+        # snapshots indices are random between the indices
+        snapshotIndicesLimits = np.round(np.linspace(0, steps, n_snapshots + 1)).astype(int)
+        # Randomly select one timepoint in each snapshot interval
+        snapshotIndices = [np.random.randint(snapshotIndicesLimits[i], snapshotIndicesLimits[i+1])
+                       for i in range(n_snapshots)]
+        # Logging for debugging
         
-        if trys > 1:
-            print('try', trys)
+        print(f"Cell {cellid} snapshot indices:", snapshotIndices)
+
+        colNames = [f'E{cellid}_t{i}' for i in range(n_snapshots)]
+        subset = P[rnaIndex, :][:, snapshotIndices]
+        df = pd.DataFrame(subset, index=genelist, columns=colNames)
+
+    # 4) Save to CSV
+    df.to_csv(os.path.join(outPrefix, f'E{cellid}.csv'))
+    print("[Cell %d] Simulation complete." % cellid)
+
+    
+    # Debug prints if we had multiple tries
+    if tries > 1:
+        print(f'[Cell {cellid}] took {tries} tries to get non-zero expression.')
